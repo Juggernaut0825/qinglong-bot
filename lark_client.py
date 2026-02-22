@@ -31,6 +31,18 @@ async def lark_api(method: str, path: str, **kwargs) -> dict:
         return r.json()
 
 
+async def download_lark_image(message_id: str, image_key: str) -> bytes:
+    """Download image from Lark and return raw bytes."""
+    token = await _get_tenant_token()
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{LARK_HOST}/open-apis/im/v1/messages/{message_id}/resources/{image_key}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"type": "image"},
+        )
+        return r.content
+
+
 async def send_lark_message(chat_id: str, text: str):
     await lark_api(
         "post",

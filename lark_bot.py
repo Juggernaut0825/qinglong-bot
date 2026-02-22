@@ -3,32 +3,31 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request
-from lark_client import send_lark_message
+from lark_client import send_lark_message, download_lark_image
 from agent import run_agent
+from storage import save_message
 
 app = FastAPI()
 
 # simple dedup: track processed event IDs
 _seen: set[str] = set()
-# per-chat conversation history (in-memory)
-_history: dict[str, list] = {}
-MAX_HISTORY = 20
 
 
-def _extract_text_and_chat(data: dict) -> tuple[str | None, str | None, str | None]:
-    """Extract user text, chat_id, and image_key from Lark event."""
+def _extract_event_info(data: dict) -> dict:
+    """Extract text, chat_id, image_key, message_id from Lark event."""
     event = data.get("event", {})
     msg = event.get("message", {})
     chat_id = msg.get("chat_id")
-    # text message
+    message_id = msg.get("message_id")
+    msg_type = msg.get("message_type", "text")
     content = msg.get("content", "{}")
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError:
         parsed = {}
     text = parsed.get("text", "").strip()
-    image_key = parsed.get("image_key")
-    return text, chat_id, image_key
+    image_key = parsed.get("image_key") if msg_type == "image" else None
+    return {"text": text, "chat_id": chat_id, "image_key": image_key, "message_id": message_id}
 
 
 @app.post("/lark/webhook")
@@ -53,28 +52,39 @@ async def webhook(request: Request):
     if event_type != "im.message.receive_v1":
         return {"ok": True}
 
-    text, chat_id, image_key = _extract_text_and_chat(data)
-    if not chat_id or not text:
+    info = _extract_event_info(data)
+    chat_id = info["chat_id"]
+    text = info["text"]
+    image_key = info["image_key"]
+    message_id = info["message_id"]
+
+    if not chat_id:
         return {"ok": True}
 
-    # handle image: prepend image context
-    if image_key:
-        text = f"[User sent an image: image_key={image_key}] {text}"
+    # image-only messages have no text — give them a default prompt
+    if image_key and not text:
+        text = "What's in this image?"
+    if not text:
+        return {"ok": True}
 
     # run agent in background so we return 200 fast
-    asyncio.create_task(_handle(chat_id, text))
+    asyncio.create_task(_handle(chat_id, text, image_key, message_id))
     return {"ok": True}
 
 
-async def _handle(chat_id: str, text: str):
-    history = _history.setdefault(chat_id, [])
+async def _handle(chat_id: str, text: str, image_key: str | None = None, message_id: str | None = None):
+    # if user sent an image, download it and convert to base64 data URI
+    if image_key and message_id:
+        import base64
+        img_bytes = await download_lark_image(message_id, image_key)
+        b64 = base64.b64encode(img_bytes).decode()
+        text = f"[image:data:image/png;base64,{b64}] {text}"
+
+    save_message(chat_id, "user", text)
     try:
-        replies = await run_agent(text, history)
+        replies = await run_agent(chat_id, text)
     except Exception as e:
         replies = [f"Oops, something went wrong 😥: {e}"]
-
-    # update history
-    history.append({"role": "user", "content": text})
 
     # send replies as separate messages for natural feel
     for i, part in enumerate(replies):
@@ -82,9 +92,5 @@ async def _handle(chat_id: str, text: str):
         if i < len(replies) - 1:
             await asyncio.sleep(0.5)
 
-    # store assistant reply in history
-    history.append({"role": "assistant", "content": "\n\n".join(replies)})
-
-    # trim history
-    if len(history) > MAX_HISTORY:
-        _history[chat_id] = history[-MAX_HISTORY:]
+    # store assistant reply
+    save_message(chat_id, "assistant", "\n\n".join(replies))

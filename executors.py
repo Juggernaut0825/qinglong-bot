@@ -1,4 +1,4 @@
-import subprocess, json
+import subprocess, json, httpx as _httpx
 from lark_client import lark_api
 
 # ── Weather ────────────────────────────────────────────────────────────
@@ -7,20 +7,34 @@ async def run_weather(args: dict) -> str:
     loc = args["location"].replace(" ", "+")
     mode = args.get("mode", "current")
     fmt = {"current": "?format=3", "forecast": "?0", "week": "?format=v2"}[mode]
-    r = subprocess.run(["curl", "-s", f"wttr.in/{loc}{fmt}"], capture_output=True, text=True, timeout=10)
-    return r.stdout.strip() or "Could not fetch weather data."
+    async with _httpx.AsyncClient(timeout=15) as c:
+        r = await c.get(f"https://wttr.in/{loc}{fmt}", headers={"User-Agent": "curl"})
+        return r.text.strip() or "Could not fetch weather data."
 
 
 # ── Summarize ──────────────────────────────────────────────────────────
 
 async def run_summarize(args: dict) -> str:
-    import os, httpx
+    import os, re, httpx
     target = args["target"]
     length = args.get("length", "medium")
-    # fetch content from URL
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
-        r = await c.get(target)
-        content = r.text[:15000]  # cap to avoid token overflow
+
+    # YouTube: use youtube-transcript-api
+    yt_match = re.search(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})", target)
+    if yt_match:
+        vid = yt_match.group(1)
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+            ytt = YouTubeTranscriptApi()
+            transcript = ytt.fetch(vid)
+            content = " ".join(s.text for s in transcript.snippets)[:15000]
+        except Exception as e:
+            content = f"[Could not extract transcript for YouTube video {vid}: {e}]"
+    else:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+            r = await c.get(target)
+            content = r.text[:15000]
+
     prompt = f"Summarize the following content ({length} length):\n\n{content}"
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.post(
@@ -51,15 +65,30 @@ async def run_lark_doc(args: dict) -> str:
         return json.dumps(data.get("data", data), ensure_ascii=False)
 
     if action == "write":
-        # Delete all blocks then create new ones via markdown-ish approach
-        # For simplicity, use the batch update endpoint
-        await lark_api("delete", f"/docx/v1/documents/{token}/blocks/batch_delete",
-                        json={"block_ids": []})  # placeholder
-        return "Write action requires Lark Docx block API integration. Token: " + token
+        # get document block ID (root block), then delete children and re-create
+        doc_info = await lark_api("get", f"/docx/v1/documents/{token}")
+        doc_block_id = doc_info.get("data", {}).get("document", {}).get("document_id", token)
+        # list existing blocks to delete
+        blocks = await lark_api("get", f"/docx/v1/documents/{token}/blocks/{doc_block_id}/children")
+        child_ids = [b["block_id"] for b in blocks.get("data", {}).get("items", []) if b.get("block_id")]
+        if child_ids:
+            await lark_api("delete", f"/docx/v1/documents/{token}/blocks/{doc_block_id}/children/batch_delete",
+                           json={"start_index": 0, "end_index": len(child_ids)})
+        # create new text block with content
+        content_text = args.get("content", "")
+        await lark_api("post", f"/docx/v1/documents/{token}/blocks/{doc_block_id}/children",
+                       json={"children": [{"block_type": 2, "text": {"elements": [{"text_run": {"content": content_text}}]}}],
+                             "index": 0})
+        return f"Document {token} updated."
 
     if action == "append":
-        # Append uses create_block endpoint
-        return "Append executed for doc " + token
+        doc_info = await lark_api("get", f"/docx/v1/documents/{token}")
+        doc_block_id = doc_info.get("data", {}).get("document", {}).get("document_id", token)
+        content_text = args.get("content", "")
+        await lark_api("post", f"/docx/v1/documents/{token}/blocks/{doc_block_id}/children",
+                       json={"children": [{"block_type": 2, "text": {"elements": [{"text_run": {"content": content_text}}]}}],
+                             "index": -1})
+        return f"Content appended to doc {token}."
 
     if action == "list_blocks":
         data = await lark_api("get", f"/docx/v1/documents/{token}/blocks")
@@ -117,22 +146,23 @@ async def run_lark_perm(args: dict) -> str:
 # ── LLaVA (image analysis via OpenRouter vision model) ─────────────────
 
 async def run_llava(args: dict) -> str:
-    """Use the chat model's vision capability via OpenRouter instead of local LLaVA."""
+    """Use the chat model's vision capability via OpenRouter."""
     import os, httpx
     question = args.get("question", "Describe this image in detail.")
-    r = httpx.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
-        json={
-            "model": "google/gemini-3-flash-preview",
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": args["image_url"]}},
-                {"type": "text", "text": question},
-            ]}],
-        },
-        timeout=30,
-    )
-    data = r.json()
+    image_url = args["image_url"]
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+            json={
+                "model": "google/gemini-3-flash-preview",
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": question},
+                ]}],
+            },
+        )
+        data = r.json()
     return data["choices"][0]["message"]["content"]
 
 
