@@ -74,11 +74,11 @@ def _make_user_content(text: str):
             {"type": "image_url", "image_url": {"url": m.group(1)}},
             {"type": "text", "text": m.group(2) or "What's in this image?"},
         ]
-    # PDF file — extract base64, send as inline_data for Gemini via OpenRouter
-    m = re.match(r"\[file:(data:application/pdf;base64,[^\]]+)\]\s*(.*)", text, re.DOTALL)
+    # PDF file — send as inline_data for Gemini via OpenRouter
+    m = re.match(r"\[file:data:application/pdf;base64,([^\]]+)\]\s*(.*)", text, re.DOTALL)
     if m:
         return [
-            {"type": "file", "file": {"url": m.group(1)}},
+            {"type": "image_url", "image_url": {"url": f"data:application/pdf;base64,{m.group(1)}"}},
             {"type": "text", "text": m.group(2) or "Please analyze this PDF."},
         ]
     return text
@@ -105,6 +105,9 @@ async def run_agent(chat_id: str, user_text: str) -> list[str]:
     # tool-call loop (max 5 rounds to avoid infinite loops)
     for _ in range(5):
         resp = await chat_completion(messages)
+        if "choices" not in resp:
+            err = resp.get("error", {}).get("message", "Unknown API error")
+            return [f"Sorry, I hit an API error: {err}"]
         choice = resp["choices"][0]
         msg = choice["message"]
         messages.append(msg)

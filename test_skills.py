@@ -123,9 +123,11 @@ async def test_agent_pdf_multimodal():
     text = "[file:data:application/pdf;base64,JVBERi0=] Please analyze this PDF."
     content = _make_user_content(text)
     assert isinstance(content, list), f"Expected list, got {type(content)}"
-    assert content[0]["type"] == "file"
+    assert content[0]["type"] == "image_url", f"Expected image_url, got {content[0]['type']}"
+    assert "data:application/pdf;base64," in content[0]["image_url"]["url"]
     assert content[1]["type"] == "text"
     print(f"Multimodal content types: {[c['type'] for c in content]}")
+    print(f"PDF URL prefix: {content[0]['image_url']['url'][:40]}...")
     print("PASS\n")
 
 async def main():
