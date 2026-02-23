@@ -1,5 +1,6 @@
-import os, time, json, httpx
+import os, time, json, httpx, logging
 
+log = logging.getLogger("lark_client")
 LARK_HOST = "https://open.larksuite.com"
 _token_cache = {"token": "", "expires": 0}
 
@@ -31,8 +32,8 @@ async def lark_api(method: str, path: str, **kwargs) -> dict:
         return r.json()
 
 
-async def download_lark_image(message_id: str, image_key: str) -> bytes:
-    """Download image from Lark and return raw bytes."""
+async def download_lark_image(message_id: str, image_key: str) -> bytes | None:
+    """Download image from Lark and return raw bytes, or None on error."""
     token = await _get_tenant_token()
     async with httpx.AsyncClient() as c:
         r = await c.get(
@@ -40,7 +41,33 @@ async def download_lark_image(message_id: str, image_key: str) -> bytes:
             headers={"Authorization": f"Bearer {token}"},
             params={"type": "image"},
         )
+        ct = r.headers.get("content-type", "")
+        if "image" not in ct:
+            log.error("download_lark_image got non-image response: status=%s ct=%s body=%s",
+                      r.status_code, ct, r.text[:500])
+            return None
+        log.info("download_lark_image OK: %d bytes", len(r.content))
         return r.content
+
+
+async def download_lark_file(message_id: str, file_key: str) -> tuple[bytes | None, str]:
+    """Download file from Lark. Returns (bytes, filename) or (None, '')."""
+    token = await _get_tenant_token()
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
+            f"{LARK_HOST}/open-apis/im/v1/messages/{message_id}/resources/{file_key}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"type": "file"},
+        )
+        if r.status_code != 200:
+            log.error("download_lark_file failed: status=%s body=%s", r.status_code, r.text[:500])
+            return None, ""
+        cd = r.headers.get("content-disposition", "")
+        fname = ""
+        if "filename=" in cd:
+            fname = cd.split("filename=")[-1].strip('" ')
+        log.info("download_lark_file OK: %d bytes, filename=%s", len(r.content), fname)
+        return r.content, fname
 
 
 async def send_lark_message(chat_id: str, text: str):

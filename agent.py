@@ -1,8 +1,10 @@
-import os, json, re, yaml, httpx
+import os, json, re, yaml, httpx, logging
 from pathlib import Path
 from skills import TOOLS
 from executors import execute_tool
 from storage import get_recent_messages, get_summary, save_summary, count_messages, get_old_messages
+
+log = logging.getLogger("agent")
 
 _cfg = yaml.safe_load((Path(__file__).parent / "config.yaml").read_text())
 SYSTEM_PROMPT = _cfg["system_prompt"]
@@ -20,7 +22,10 @@ async def chat_completion(messages: list) -> dict:
             headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
             json={"model": MODEL, "messages": messages, "tools": TOOLS},
         )
-        return r.json()
+        data = r.json()
+        if "error" in data:
+            log.error("OpenRouter error: %s", data["error"])
+        return data
 
 
 def split_reply(text: str) -> list[str]:
@@ -61,12 +66,20 @@ async def _summarize_old(chat_id: str):
 
 
 def _make_user_content(text: str):
-    """Convert text with [image:data:...] prefix into multimodal content."""
+    """Convert text with [image:data:...] or [file:data:...] prefix into multimodal content."""
+    # Image
     m = re.match(r"\[image:(data:[^\]]+)\]\s*(.*)", text, re.DOTALL)
     if m:
         return [
             {"type": "image_url", "image_url": {"url": m.group(1)}},
             {"type": "text", "text": m.group(2) or "What's in this image?"},
+        ]
+    # PDF file — extract base64, send as inline_data for Gemini via OpenRouter
+    m = re.match(r"\[file:(data:application/pdf;base64,[^\]]+)\]\s*(.*)", text, re.DOTALL)
+    if m:
+        return [
+            {"type": "file", "file": {"url": m.group(1)}},
+            {"type": "text", "text": m.group(2) or "Please analyze this PDF."},
         ]
     return text
 

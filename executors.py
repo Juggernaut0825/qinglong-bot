@@ -1,5 +1,7 @@
-import subprocess, json, httpx as _httpx
+import subprocess, json, logging, httpx as _httpx
 from lark_client import lark_api
+
+log = logging.getLogger("executors")
 
 # ── Weather ────────────────────────────────────────────────────────────
 
@@ -19,17 +21,26 @@ async def run_summarize(args: dict) -> str:
     target = args["target"]
     length = args.get("length", "medium")
 
-    # YouTube: use youtube-transcript-api
+    # YouTube: use youtube-transcript-api with language fallback
     yt_match = re.search(r"(?:youtu\.be/|youtube\.com/watch\?v=|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})", target)
     if yt_match:
         vid = yt_match.group(1)
+        content = None
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
             ytt = YouTubeTranscriptApi()
             transcript = ytt.fetch(vid)
             content = " ".join(s.text for s in transcript.snippets)[:15000]
         except Exception as e:
-            content = f"[Could not extract transcript for YouTube video {vid}: {e}]"
+            log.warning("youtube-transcript-api failed for %s: %s", vid, e)
+        if not content:
+            # fallback: fetch page and ask LLM to work with whatever we get
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
+                    r = await c.get(f"https://www.youtube.com/watch?v={vid}")
+                    content = f"[YouTube page HTML excerpt for video {vid}]:\n{r.text[:8000]}"
+            except Exception as e2:
+                content = f"[Could not access YouTube video {vid}. Transcript unavailable: {e2}]"
     else:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
             r = await c.get(target)
@@ -193,6 +204,10 @@ async def execute_tool(name: str, args: dict) -> str:
     if not fn:
         return f"Unknown tool: {name}"
     try:
-        return await fn(args)
+        log.info("executing tool %s with args %s", name, {k: str(v)[:100] for k, v in args.items()})
+        result = await fn(args)
+        log.info("tool %s returned %d chars", name, len(result))
+        return result
     except Exception as e:
+        log.exception("tool %s failed", name)
         return f"Error running {name}: {e}"
